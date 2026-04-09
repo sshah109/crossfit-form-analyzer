@@ -1,5 +1,5 @@
 libgl1
 libgthread-2.0-0
+libxext6
 libsm6
 libxrender1
-libxext6
