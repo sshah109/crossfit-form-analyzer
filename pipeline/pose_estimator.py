@@ -1,100 +1,103 @@
 import os
 import sys
+import urllib.request
+
 import cv2
-import requests
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 
-API_URL = "https://api-inference.huggingface.co/models/google/movenet-singlepose-thunder"
+# ---------------------------------------------------------------------------
+# Model — downloaded once to pipeline/ on first use
+# ---------------------------------------------------------------------------
 
-# MoveNet returns 17 keypoints in this order
-KEYPOINT_NAMES = [
-    "nose",
-    "left_eye", "right_eye",
-    "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder",
-    "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist",
-    "left_hip", "right_hip",
-    "left_knee", "right_knee",
-    "left_ankle", "right_ankle",
-]
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_full.task")
 
 
-def get_hf_token():
-    """
-    Return the HuggingFace token from Streamlit secrets if available,
-    otherwise fall back to the HF_TOKEN environment variable.
-    """
-    try:
-        import streamlit as st
-        return st.secrets["HF_TOKEN"]
-    except Exception:
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            raise RuntimeError(
-                "HF_TOKEN not found. Set it in .streamlit/secrets.toml or as an env variable."
-            )
-        return token
+# ---------------------------------------------------------------------------
+# MediaPipe landmark index → our keypoint name
+# ---------------------------------------------------------------------------
+
+LANDMARK_MAP = {
+    0:  "nose",
+    11: "left_shoulder",
+    12: "right_shoulder",
+    13: "left_elbow",
+    14: "right_elbow",
+    15: "left_wrist",
+    16: "right_wrist",
+    23: "left_hip",
+    24: "right_hip",
+    25: "left_knee",
+    26: "right_knee",
+    27: "left_ankle",
+    28: "right_ankle",
+}
+
+_landmarker = None
 
 
-def frame_to_bytes(frame):
-    """
-    Encode a BGR numpy array to JPEG bytes for the API request.
-    """
-    success, buffer = cv2.imencode(".jpg", frame)
-    if not success:
-        raise ValueError("Failed to encode frame as JPEG.")
-    return buffer.tobytes()
+def _ensure_model():
+    """Download the pose landmarker model file if not already on disk."""
+    if not os.path.exists(MODEL_PATH):
+        print(f"Downloading pose model ({MODEL_URL})...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print(f"Model saved to {MODEL_PATH}")
 
 
-def parse_keypoints(response_json):
-    """
-    Parse the HuggingFace MoveNet API response into a flat dict:
-        { "nose": {"x": float, "y": float, "confidence": float}, ... }
-
-    MoveNet returns keypoints as a list of dicts with keys:
-        "label", "score", "x", "y"
-    """
-    keypoints = {}
-
-    # Response is a list of keypoint dicts: [{"label": "nose", "score": 0.9, "x": 0.5, "y": 0.3}, ...]
-    if isinstance(response_json, list):
-        for kp in response_json:
-            label = kp.get("label")
-            if label:
-                keypoints[label] = {
-                    "x": kp.get("x", 0.0),
-                    "y": kp.get("y", 0.0),
-                    "confidence": kp.get("score", 0.0),
-                }
-
-    return keypoints
+def _get_landmarker():
+    """Lazy-initialise the PoseLandmarker (once per process)."""
+    global _landmarker
+    if _landmarker is None:
+        _ensure_model()
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        _landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+    return _landmarker
 
 
 def get_keypoints(frame):
     """
-    Send a single frame (numpy array) to the HuggingFace MoveNet API
-    and return a dict of keypoints.
+    Run MediaPipe Pose Landmarker on a single BGR frame and return keypoints.
 
     Args:
         frame: BGR numpy array.
 
     Returns:
         Dict mapping joint name → {"x": float, "y": float, "confidence": float}.
-        Coordinates are normalized 0–1 relative to image dimensions.
+        Coordinates are normalized 0–1. Returns empty dict if no person detected.
     """
-    token = get_hf_token()
-    image_bytes = frame_to_bytes(frame)
-    headers = {"Authorization": f"Bearer {token}"}
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    response = requests.post(API_URL, headers=headers, data=image_bytes)
+    results = _get_landmarker().detect(mp_image)
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"API request failed ({response.status_code}): {response.text}"
-        )
+    if not results.pose_landmarks:
+        return {}
 
-    return parse_keypoints(response.json())
+    landmarks = results.pose_landmarks[0]  # single-person mode
+
+    keypoints = {}
+    for idx, name in LANDMARK_MAP.items():
+        lm = landmarks[idx]
+        keypoints[name] = {
+            "x":          float(lm.x),
+            "y":          float(lm.y),
+            "confidence": float(lm.visibility) if lm.visibility is not None else 1.0,
+        }
+
+    return keypoints
 
 
 if __name__ == "__main__":
@@ -104,7 +107,6 @@ if __name__ == "__main__":
 
     path = sys.argv[1]
 
-    # Accept either a static image or a video (use first frame)
     if path.lower().endswith((".jpg", ".jpeg", ".png")):
         frame = cv2.imread(path)
         if frame is None:
@@ -118,11 +120,11 @@ if __name__ == "__main__":
             print(f"Could not read first frame from video: {path}")
             sys.exit(1)
 
-    print(f"Sending frame ({frame.shape}) to HuggingFace MoveNet API...")
+    print(f"Running MediaPipe Pose Landmarker on frame {frame.shape}...")
     keypoints = get_keypoints(frame)
 
     if not keypoints:
-        print("No keypoints returned. Check the API response format.")
+        print("No pose detected. Try a frame where the full body is visible.")
     else:
         print(f"Got {len(keypoints)} keypoints:")
         for name, kp in keypoints.items():

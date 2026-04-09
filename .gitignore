@@ -1,0 +1,31 @@
+# Secrets — never commit
+.streamlit/secrets.toml
+
+# MediaPipe model files — downloaded at runtime
+pipeline/*.task
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data files
+data/keypoints/*.json
+data/keypoints/*.csv
+data/keypoints/*.npy
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
